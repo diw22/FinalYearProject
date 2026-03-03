@@ -17,9 +17,9 @@ from lerobot.robots.rigby import RigbyConfig, Rigby
 # from lerobot.robots.rigby import RigbyClient, RigbyClientConfig
 
 from lerobot.teleoperators.keyboard import KeyboardTeleop, KeyboardTeleopConfig
-from lerobot.kinematics.so101_kinematics import SO101Kinematics
+from lerobot.model.SO101Robot import SO101Kinematics
 
-from lerobot.utils.rerun import init_rerun, log_rerun_data
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 
 # ----------------------------
