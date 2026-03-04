@@ -1,18 +1,20 @@
-# lerobot/robots/rigbo/rigbo.py
+#!/usr/bin/env python
 
 import logging
+import time
 from functools import cached_property
+from itertools import chain
 from typing import Any
 
 import numpy as np
 
 from lerobot.cameras.utils import make_cameras_from_configs
-from lerobot.motors import Motor, MotorNormMode
-from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
-from lerobot.robots.robot import Robot
-from lerobot.robots.utils import ensure_safe_goal_position
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.motors import Motor, MotorCalibration, MotorNormMode
+from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
 
+from ..robot import Robot
+from ..utils import ensure_safe_goal_position
 from .config_rigbo import RigboConfig
 
 logger = logging.getLogger(__name__)
@@ -20,11 +22,14 @@ logger = logging.getLogger(__name__)
 
 class Rigbo(Robot):
     """
-    Rigbo: single arm + omni base (no head).
+    One arm + one omniwheel base.
 
-    Goal: behave as close to the XLerobot keyboard teleop stack as possible.
-    - action space: left_arm_*.pos + x.vel/y.vel/theta.vel
-    - observation:  left_arm_*.pos + x.vel/y.vel/theta.vel
+    Goal: be as close to xlerobot.py as possible.
+    Changes vs XLerobot:
+      - Removed right arm
+      - Removed head
+      - Kept base + keyboard teleop contract identical (x.vel/y.vel/theta.vel)
+      - Kept state/action naming identical for a single arm: left_arm_*.pos
     """
 
     config_class = RigboConfig
@@ -35,51 +40,72 @@ class Rigbo(Robot):
         self.config = config
         self.teleop_keys = config.teleop_keys
 
-        # Match the XLerobot speed ladder exactly
+        # Define three speed levels and a current index (same as xlerobot.py)
         self.speed_levels = [
             {"xy": 0.1, "theta": 30},  # slow
             {"xy": 0.2, "theta": 60},  # medium
             {"xy": 0.3, "theta": 90},  # fast
         ]
-        self.speed_index = 0
+        self.speed_index = 0  # Start at slow
 
-        arm_norm_mode = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
+        norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
 
-        # --- Single Arm (use LEFT naming to match teleop script and XLerobot convention) ---
-        self.bus_arm = FeetechMotorsBus(
-            port=config.port_arm,
+        # Match xlerobot.py behavior: if calibration contains a key, build a calibration dict scoped to this bus
+        if self.calibration.get("left_arm_shoulder_pan") is not None:
+            calibration1 = {
+                "left_arm_shoulder_pan": self.calibration.get("left_arm_shoulder_pan"),
+                "left_arm_shoulder_lift": self.calibration.get("left_arm_shoulder_lift"),
+                "left_arm_elbow_flex": self.calibration.get("left_arm_elbow_flex"),
+                "left_arm_wrist_flex": self.calibration.get("left_arm_wrist_flex"),
+                "left_arm_wrist_roll": self.calibration.get("left_arm_wrist_roll"),
+                "left_arm_gripper": self.calibration.get("left_arm_gripper"),
+            }
+        else:
+            calibration1 = self.calibration
+
+        # BUS 1: left arm
+        self.bus1 = FeetechMotorsBus(
+            port=self.config.port_arm,
             motors={
-                "left_arm_shoulder_pan": Motor(1, "sts3215", arm_norm_mode),
-                "left_arm_shoulder_lift": Motor(2, "sts3215", arm_norm_mode),
-                "left_arm_elbow_flex": Motor(3, "sts3215", arm_norm_mode),
-                "left_arm_wrist_flex": Motor(4, "sts3215", arm_norm_mode),
-                "left_arm_wrist_roll": Motor(5, "sts3215", arm_norm_mode),
+                "left_arm_shoulder_pan": Motor(1, "sts3215", norm_mode_body),
+                "left_arm_shoulder_lift": Motor(2, "sts3215", norm_mode_body),
+                "left_arm_elbow_flex": Motor(3, "sts3215", norm_mode_body),
+                "left_arm_wrist_flex": Motor(4, "sts3215", norm_mode_body),
+                "left_arm_wrist_roll": Motor(5, "sts3215", norm_mode_body),
                 "left_arm_gripper": Motor(6, "sts3215", MotorNormMode.RANGE_0_100),
             },
-            calibration=self.calibration,
+            calibration=calibration1,
         )
 
-        # --- Base (3-wheel omni) ---
-        self.bus_base = FeetechMotorsBus(
-            port=config.port_base,
+        if self.calibration.get("base_left_wheel") is not None:
+            calibration2 = {
+                "base_left_wheel": self.calibration.get("base_left_wheel"),
+                "base_back_wheel": self.calibration.get("base_back_wheel"),
+                "base_right_wheel": self.calibration.get("base_right_wheel"),
+            }
+        else:
+            calibration2 = self.calibration
+
+        # BUS 2: base
+        self.bus2 = FeetechMotorsBus(
+            port=self.config.port_base,
             motors={
                 "base_left_wheel": Motor(1, "sts3215", MotorNormMode.RANGE_M100_100),
                 "base_back_wheel": Motor(2, "sts3215", MotorNormMode.RANGE_M100_100),
                 "base_right_wheel": Motor(3, "sts3215", MotorNormMode.RANGE_M100_100),
             },
-            calibration=self.calibration,
+            calibration=calibration2,
         )
 
-        self.left_arm_motors = list(self.bus_arm.motors.keys())
-        self.base_motors = list(self.bus_base.motors.keys())
+        self.left_arm_motors = [motor for motor in self.bus1.motors if motor.startswith("left_arm")]
+        self.base_motors = [motor for motor in self.bus2.motors if motor.startswith("base")]
 
         self.cameras = make_cameras_from_configs(config.cameras)
 
-    # ---------------- Features ----------------
+    # ---------- Feature typing (same pattern as xlerobot.py) ----------
 
-    @cached_property
-    def observation_features(self):
-        # EXACT contract expected by your teleop script + “XLerobot style”
+    @property
+    def _state_ft(self) -> dict[str, type]:
         return dict.fromkeys(
             (
                 "left_arm_shoulder_pan.pos",
@@ -95,71 +121,164 @@ class Rigbo(Robot):
             float,
         )
 
-    action_features = observation_features
+    @property
+    def _cameras_ft(self) -> dict[str, tuple]:
+        return {
+            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
+        }
+
+    @cached_property
+    def observation_features(self) -> dict[str, type | tuple]:
+        return {**self._state_ft, **self._cameras_ft}
+
+    @cached_property
+    def action_features(self) -> dict[str, type]:
+        return self._state_ft
 
     @property
-    def is_connected(self):
-        return self.bus_arm.is_connected and self.bus_base.is_connected
+    def is_connected(self) -> bool:
+        return self.bus1.is_connected and self.bus2.is_connected and all(
+            cam.is_connected for cam in self.cameras.values()
+        )
 
-    # ---------------- Lifecycle ----------------
+    # ---------- Connect / calibration flow (mirrors xlerobot.py) ----------
 
-    def connect(self):
+    def connect(self, calibrate: bool = True) -> None:
         if self.is_connected:
-            raise DeviceAlreadyConnectedError("Rigbo already connected")
+            raise DeviceAlreadyConnectedError(f"{self} already connected")
 
-        self.bus_arm.connect()
-        self.bus_base.connect()
+        self.bus1.connect()
+        self.bus2.connect()
 
-        # Configure modes BEFORE torque (prevents weird behavior)
+        # Check if calibration file exists and ask user if they want to restore it
+        if self.calibration_fpath.is_file():
+            logger.info(f"Calibration file found at {self.calibration_fpath}")
+            user_input = input(
+                "Press ENTER to restore calibration from file, or type 'c' and press ENTER to run manual calibration: "
+            )
+            if user_input.strip().lower() != "c":
+                logger.info("Attempting to restore calibration from file...")
+                try:
+                    # Load calibration data into bus memory
+                    self.bus1.calibration = {k: v for k, v in self.calibration.items() if k in self.bus1.motors}
+                    self.bus2.calibration = {k: v for k, v in self.calibration.items() if k in self.bus2.motors}
+                    logger.info("Calibration data loaded into bus memory successfully!")
+
+                    # Write calibration data to motors
+                    self.bus1.write_calibration({k: v for k, v in self.calibration.items() if k in self.bus1.motors})
+                    self.bus2.write_calibration({k: v for k, v in self.calibration.items() if k in self.bus2.motors})
+                    logger.info("Calibration restored successfully from file!")
+
+                except Exception as e:
+                    logger.warning(f"Failed to restore calibration from file: {e}")
+                    if calibrate:
+                        logger.info("Proceeding with manual calibration...")
+                        self.calibrate()
+            else:
+                logger.info("User chose manual calibration...")
+                if calibrate:
+                    self.calibrate()
+        elif calibrate:
+            logger.info("No calibration file found, proceeding with manual calibration...")
+            self.calibrate()
+
+        for cam in self.cameras.values():
+            cam.connect()
+
         self.configure()
+        logger.info(f"{self} connected.")
 
-        self.bus_arm.enable_torque()
-        self.bus_base.enable_torque()
+    @property
+    def is_calibrated(self) -> bool:
+        return self.bus1.is_calibrated and self.bus2.is_calibrated
+
+    def calibrate(self) -> None:
+        logger.info(f"\nRunning calibration of {self}")
+
+        # ---- calibrate left arm (bus1) ----
+        left_motors = self.left_arm_motors
+        self.bus1.disable_torque()
+        for name in left_motors:
+            self.bus1.write("Operating_Mode", name, OperatingMode.POSITION.value)
+
+        input("Move left arm motors to the middle of their range of motion and press ENTER....")
+
+        homing_offsets = self.bus1.set_half_turn_homings(left_motors)
+
+        print(
+            "Move all left arm joints sequentially through their entire ranges of motion.\n"
+            "Recording positions. Press ENTER to stop..."
+        )
+        range_mins, range_maxes = self.bus1.record_ranges_of_motion(left_motors)
+
+        calibration_left: dict[str, MotorCalibration] = {}
+        for name, motor in self.bus1.motors.items():
+            calibration_left[name] = MotorCalibration(
+                id=motor.id,
+                drive_mode=0,
+                homing_offset=homing_offsets[name],
+                range_min=range_mins[name],
+                range_max=range_maxes[name],
+            )
+
+        self.bus1.write_calibration(calibration_left)
+
+        # ---- calibrate base (bus2) ----
+        # Wheels are full-turn: assign a known full range and homing offset 0 (same approach used in xlerobot.py for wheels)
+        self.bus2.disable_torque()
+        for name in self.base_motors:
+            # keep base in velocity mode normally; during calibration torque is off anyway
+            pass
+
+        calibration_base: dict[str, MotorCalibration] = {}
+        for name, motor in self.bus2.motors.items():
+            calibration_base[name] = MotorCalibration(
+                id=motor.id,
+                drive_mode=0,
+                homing_offset=0,
+                range_min=0,
+                range_max=4095,
+            )
+
+        self.bus2.write_calibration(calibration_base)
+
+        # Save merged calibration like xlerobot.py
+        self.calibration = {**calibration_left, **calibration_base}
+        self._save_calibration()
+        print("Calibration saved to", self.calibration_fpath)
 
     def configure(self):
-        """
-        Keep this consistent with the baseline behavior:
-        - Arm in POSITION mode
-        - Base in VELOCITY mode
-        - Basic PID values for position control (safe defaults)
-        """
-        if not (self.bus_arm.is_connected and self.bus_base.is_connected):
-            # allow calling pre-connect if someone wants, but do nothing
-            return
+        # Match xlerobot.py structure: disable torque, configure_motors, then set modes and coefficients.
 
-        # Arm: position mode + PID
-        self.bus_arm.sync_write(
-            "Operating_Mode",
-            dict.fromkeys(self.left_arm_motors, OperatingMode.POSITION),
-            num_retry=5,
-        )
-        # These match typical baseline tuning patterns; adjust only if your hardware requires it
-        self.bus_arm.sync_write("Position_P_Gain", dict.fromkeys(self.left_arm_motors, 16), num_retry=5)
-        self.bus_arm.sync_write("Position_I_Gain", dict.fromkeys(self.left_arm_motors, 0), num_retry=5)
-        self.bus_arm.sync_write("Position_D_Gain", dict.fromkeys(self.left_arm_motors, 43), num_retry=5)
+        # bus 1 (arm)
+        self.bus1.disable_torque()
+        self.bus1.configure_motors()
 
-        # Base: velocity mode
-        self.bus_base.sync_write(
-            "Operating_Mode",
-            dict.fromkeys(self.base_motors, OperatingMode.VELOCITY),
-            num_retry=5,
-        )
+        for name in self.left_arm_motors:
+            self.bus1.write("Operating_Mode", name, OperatingMode.POSITION.value)
+            # Coefficients consistent with xlerobot.py
+            self.bus1.write("P_Coefficient", name, 16)
+            self.bus1.write("I_Coefficient", name, 0)
+            self.bus1.write("D_Coefficient", name, 43)
 
-    def disconnect(self):
-        if not self.is_connected:
-            raise DeviceNotConnectedError("Rigbo not connected")
+        # bus 2 (base)
+        self.bus2.disable_torque()
+        self.bus2.configure_motors()
 
-        self.bus_arm.disconnect(self.config.disable_torque_on_disconnect)
-        self.bus_base.disconnect(self.config.disable_torque_on_disconnect)
+        for name in self.base_motors:
+            self.bus2.write("Operating_Mode", name, OperatingMode.VELOCITY.value)
 
-    # ---------------- Base Kinematics (IDENTICAL TO BASELINE STYLE) ----------------
+        # enable torque after config
+        self.bus1.enable_torque()
+        self.bus2.enable_torque()
+
+    # ---------- Base kinematics (copied in style from xlerobot.py) ----------
 
     @staticmethod
     def _degps_to_raw(degps: float) -> int:
         steps_per_deg = 4096.0 / 360.0
         speed_in_steps = degps * steps_per_deg
         speed_int = int(round(speed_in_steps))
-        # Cap to signed 16-bit range
         if speed_int > 0x7FFF:
             speed_int = 0x7FFF
         elif speed_int < -0x8000:
@@ -180,23 +299,16 @@ class Rigbo(Robot):
         base_radius: float = 0.125,
         max_raw: int = 3000,
     ) -> dict[str, int]:
-        """
-        Convert body-frame velocities:
-          x (m/s), y (m/s), theta (deg/s)
-        into wheel raw commands for:
-          base_left_wheel, base_back_wheel, base_right_wheel
-        """
         theta_rad = theta * (np.pi / 180.0)
         velocity_vector = np.array([x, y, theta_rad])
 
         angles = np.radians(np.array([240, 0, 120]) - 90)
         m = np.array([[np.cos(a), np.sin(a), base_radius] for a in angles])
 
-        wheel_linear_speeds = m.dot(velocity_vector)          # m/s
-        wheel_angular_speeds = wheel_linear_speeds / wheel_radius  # rad/s
-        wheel_degps = wheel_angular_speeds * (180.0 / np.pi)  # deg/s
+        wheel_linear_speeds = m.dot(velocity_vector)
+        wheel_angular_speeds = wheel_linear_speeds / wheel_radius
+        wheel_degps = wheel_angular_speeds * (180.0 / np.pi)
 
-        # Scale if any wheel exceeds max_raw in steps
         steps_per_deg = 4096.0 / 360.0
         raw_floats = [abs(degps) * steps_per_deg for degps in wheel_degps]
         max_raw_computed = max(raw_floats) if raw_floats else 0.0
@@ -205,7 +317,6 @@ class Rigbo(Robot):
             wheel_degps = wheel_degps * scale
 
         wheel_raw = [self._degps_to_raw(deg) for deg in wheel_degps]
-
         return {
             "base_left_wheel": wheel_raw[0],
             "base_back_wheel": wheel_raw[1],
@@ -220,10 +331,6 @@ class Rigbo(Robot):
         wheel_radius: float = 0.05,
         base_radius: float = 0.125,
     ) -> dict[str, float]:
-        """
-        Convert wheel raw velocities back into body-frame:
-          x.vel (m/s), y.vel (m/s), theta.vel (deg/s)
-        """
         wheel_degps = np.array(
             [
                 self._raw_to_degps(left_wheel_speed),
@@ -232,22 +339,22 @@ class Rigbo(Robot):
             ]
         )
         wheel_radps = wheel_degps * (np.pi / 180.0)
-        wheel_linear_speeds = wheel_radps * wheel_radius  # m/s
+        wheel_linear_speeds = wheel_radps * wheel_radius
 
         angles = np.radians(np.array([240, 0, 120]) - 90)
         m = np.array([[np.cos(a), np.sin(a), base_radius] for a in angles])
-
         m_inv = np.linalg.inv(m)
+
         velocity_vector = m_inv.dot(wheel_linear_speeds)
         x, y, theta_rad = velocity_vector
         theta = theta_rad * (180.0 / np.pi)
 
         return {"x.vel": float(x), "y.vel": float(y), "theta.vel": float(theta)}
 
-    # ---------------- Keyboard Base Mapping (IDENTICAL PATTERN) ----------------
+    # ---------- Keyboard mapping (same pattern as xlerobot.py) ----------
 
-    def _from_keyboard_to_base_action(self, pressed_keys: np.ndarray):
-        # Speed control (match baseline behavior)
+    def _from_keyboard_to_base_action(self, pressed_keys: np.ndarray) -> dict[str, float]:
+        # speed up/down (missing in your current rigbo.py)
         if self.teleop_keys["speed_up"] in pressed_keys:
             self.speed_index = min(self.speed_index + 1, 2)
         if self.teleop_keys["speed_down"] in pressed_keys:
@@ -276,73 +383,89 @@ class Rigbo(Robot):
 
         return {"x.vel": x_cmd, "y.vel": y_cmd, "theta.vel": theta_cmd}
 
-    # ---------------- I/O ----------------
+    # ---------- Observation / action IO (same layout as xlerobot.py) ----------
 
-    def get_observation(self):
+    def get_observation(self) -> dict[str, Any]:
         if not self.is_connected:
-            raise DeviceNotConnectedError("Rigbo not connected")
+            raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        arm = self.bus_arm.sync_read("Present_Position", self.left_arm_motors)
-        base = self.bus_base.sync_read("Present_Velocity", self.base_motors)
+        start = time.perf_counter()
+        left_arm_pos = self.bus1.sync_read("Present_Position", self.left_arm_motors)
+        base_wheel_vel = self.bus2.sync_read("Present_Velocity", self.base_motors)
 
-        # Convert wheel raw velocities -> body velocities
-        body_vel = self._wheel_raw_to_body(
-            base["base_left_wheel"],
-            base["base_back_wheel"],
-            base["base_right_wheel"],
+        base_vel = self._wheel_raw_to_body(
+            base_wheel_vel["base_left_wheel"],
+            base_wheel_vel["base_back_wheel"],
+            base_wheel_vel["base_right_wheel"],
         )
 
-        return {
-            **{f"{k}.pos": float(v) for k, v in arm.items()},
-            **body_vel,
-        }
+        left_arm_state = {f"{k}.pos": v for k, v in left_arm_pos.items()}
+        dt_ms = (time.perf_counter() - start) * 1e3
+        logger.debug(f"{self} read state: {dt_ms:.1f}ms")
+
+        camera_obs = self.get_camera_observation()
+        obs_dict = {**left_arm_state, **base_vel, **camera_obs}
+        return obs_dict
+
+    def get_camera_observation(self):
+        obs_dict = {}
+        for cam_key, cam in self.cameras.items():
+            start = time.perf_counter()
+            obs_dict[cam_key] = cam.async_read()
+            dt_ms = (time.perf_counter() - start) * 1e3
+            logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+        return obs_dict
 
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         """
-        Writes:
-          - left_arm_*.pos -> Goal_Position (optionally clamped)
-          - x.vel/y.vel/theta.vel -> converted -> wheel Goal_Velocity
-
-        Returns the action actually sent (clamped if max_relative_target is set).
+        Mirrors xlerobot.py:
+        - extracts left_arm_*.pos and base .vel
+        - converts body vel -> wheel raw
+        - clamps if max_relative_target set
+        - writes Goal_Position / Goal_Velocity
+        - returns action actually sent
         """
         if not self.is_connected:
-            raise DeviceNotConnectedError("Rigbo not connected")
+            raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        # Separate arm/base portions (keep exact key contract)
         left_arm_pos = {k: v for k, v in action.items() if k.startswith("left_arm_") and k.endswith(".pos")}
         base_goal_vel = {k: v for k, v in action.items() if k.endswith(".vel")}
 
-        # Convert base body velocities to wheel raw
         base_wheel_goal_vel = self._body_to_wheel_raw(
-            float(base_goal_vel.get("x.vel", 0.0)),
-            float(base_goal_vel.get("y.vel", 0.0)),
-            float(base_goal_vel.get("theta.vel", 0.0)),
+            base_goal_vel.get("x.vel", 0.0),
+            base_goal_vel.get("y.vel", 0.0),
+            base_goal_vel.get("theta.vel", 0.0),
         )
 
-        # Optional clamp (match baseline semantics)
-        if self.config.max_relative_target is not None and left_arm_pos:
-            present_pos_left = self.bus_arm.sync_read("Present_Position", self.left_arm_motors)
-            # Build (goal, present) mapping for ensure_safe_goal_position
-            goal_present_pos = {
-                key: (float(g_pos), float(present_pos_left[key.replace(".pos", "")]))
-                for key, g_pos in left_arm_pos.items()
-            }
+        if self.config.max_relative_target is not None:
+            present_pos_left = self.bus1.sync_read("Present_Position", self.left_arm_motors)
+            goal_present_pos = {key: (g_pos, present_pos_left[key.replace(".pos", "")]) for key, g_pos in left_arm_pos.items()}
             safe_goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
-            left_arm_pos = {k: v for k, v in safe_goal_pos.items()}
+            left_arm_pos = safe_goal_pos
 
-        # Strip ".pos" for bus write
         left_arm_pos_raw = {k.replace(".pos", ""): v for k, v in left_arm_pos.items()}
 
         if left_arm_pos_raw:
-            self.bus_arm.sync_write("Goal_Position", left_arm_pos_raw)
+            self.bus1.sync_write("Goal_Position", left_arm_pos_raw)
         if base_wheel_goal_vel:
-            self.bus_base.sync_write("Goal_Velocity", base_wheel_goal_vel)
+            self.bus2.sync_write("Goal_Velocity", base_wheel_goal_vel)
 
-        # Return action actually sent (same pattern as baseline)
-        return {**left_arm_pos, **base_goal_vel}
+        return {
+            **left_arm_pos,
+            **base_goal_vel,
+        }
 
     def stop_base(self):
-        if not self.is_connected:
-            raise DeviceNotConnectedError("Rigbo not connected")
-        self.bus_base.sync_write("Goal_Velocity", dict.fromkeys(self.base_motors, 0), num_retry=5)
+        self.bus2.sync_write("Goal_Velocity", dict.fromkeys(self.base_motors, 0), num_retry=5)
         logger.info("Base motors stopped")
+
+    def disconnect(self):
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        self.stop_base()
+        self.bus1.disconnect(self.config.disable_torque_on_disconnect)
+        self.bus2.disconnect(self.config.disable_torque_on_disconnect)
+        for cam in self.cameras.values():
+            cam.disconnect()
+        logger.info(f"{self} disconnected.")
